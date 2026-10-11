@@ -1,0 +1,11 @@
+{
+  "name": "dsh-plugin-deployer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DSH 插件一键部署器 — 搜索所有 dsh 插件、查看功能介绍、一键安装到本地 profile",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node check.js"
+  }
+}

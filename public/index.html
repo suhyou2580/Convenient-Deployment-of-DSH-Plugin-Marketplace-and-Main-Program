@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DSH 插件一键部署器</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◈</span>
+      <div>
+        <h1>DSH 插件一键部署器</h1>
+        <p class="sub">搜索 DeepSeek Harness 插件 · 查看功能介绍 · 一键安装到本地 profile</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="status" id="status">
+        <span class="chip loading">检测环境…</span>
+      </div>
+      <button class="btn warn" id="btnRestartWeb" title="启动或重启 dsh web 本体">⟲ 启动 / 重启 dsh web</button>
+      <button class="btn ghost" id="btnSettings">⚙ 设置</button>
+    </div>
+  </header>
+
+  <div id="pnpmBanner" class="banner hidden">
+    <span>⚠ 未检测到 <b>pnpm</b>。dsh 的插件安装依赖 pnpm，请先安装。</span>
+    <button class="btn warn small" id="btnInstallPnpm">安装 pnpm</button>
+  </div>
+
+  <main>
+    <nav class="tabs">
+      <button class="tab active" data-view="market">插件市场</button>
+      <button class="tab" data-view="installed">已安装管理</button>
+    </nav>
+
+    <section id="viewMarket">
+      <section class="controls">
+        <button class="btn primary big" id="btnLoad">加载插件</button>
+        <div class="filters hidden" id="filters">
+          <input type="search" id="filterText" placeholder="本地过滤：名称 / 描述 / 标签…" />
+          <select id="sortBy">
+            <option value="downloads">按月下载量</option>
+            <option value="recent">按更新时间</option>
+            <option value="name">按名称</option>
+          </select>
+          <select id="sizeSel">
+            <option value="24">每页 24 个</option>
+            <option value="48">每页 48 个</option>
+            <option value="100">每页 100 个</option>
+          </select>
+          <button class="btn ghost" id="btnMore" disabled>加载更多</button>
+          <button class="btn ai" id="btnBatchAi">✦ 为当前列表批量生成 AI 简介</button>
+        </div>
+      </section>
+
+      <div class="meta" id="meta"></div>
+      <div class="grid" id="grid"></div>
+      <div class="empty" id="empty">点击上方「加载插件」开始搜索 dsh 插件生态。</div>
+    </section>
+
+    <section id="viewInstalled" class="hidden">
+      <section class="controls">
+        <button class="btn primary" id="btnRefreshInstalled">刷新已安装</button>
+        <span class="meta" id="installedMeta"></span>
+      </section>
+      <div class="grid" id="installedGrid"></div>
+      <div class="empty" id="installedEmpty">切换到「已安装管理」以读取当前 profile 的插件。</div>
+    </section>
+  </main>
+
+  <!-- 设置抽屉 -->
+  <div class="overlay hidden" id="settingsOverlay">
+    <aside class="drawer">
+      <div class="drawer-head">
+        <h2>设置</h2>
+        <button class="btn ghost small" id="btnCloseSettings">关闭</button>
+      </div>
+
+      <label class="field">
+        <span>目标 Profile（插件安装到该 profile）</span>
+        <select id="setProfile"></select>
+      </label>
+
+      <label class="field">
+        <span>dsh web 端口<small>（「重启 dsh web」按钮使用）</small></span>
+        <input type="number" id="setWebPort" placeholder="3080" min="1" max="65535" />
+      </label>
+
+      <label class="field">
+        <span>AI 提供方</span>
+        <select id="setProvider">
+          <option value="deepseek">DeepSeek（默认）</option>
+          <option value="custom">自定义 OpenAI 兼容端点</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Base URL</span>
+        <input type="text" id="setBaseUrl" placeholder="https://api.deepseek.com/v1" />
+      </label>
+      <label class="field">
+        <span>模型名</span>
+        <input type="text" id="setModel" placeholder="deepseek-chat" />
+      </label>
+      <label class="field">
+        <span>API Key <small>（仅存于本机浏览器 localStorage，不会上传到本应用服务器）</small></span>
+        <input type="password" id="setApiKey" placeholder="sk-…" autocomplete="off" />
+      </label>
+
+      <p class="hint" id="deployHint"></p>
+      <div class="drawer-actions">
+        <button class="btn primary" id="btnSaveSettings">保存</button>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 二次确认 -->
+  <div class="overlay hidden" id="confirmOverlay">
+    <div class="modal">
+      <h2 id="confirmTitle">确认操作</h2>
+      <p>将执行以下命令（会在本机安装并运行第三方插件代码）：</p>
+      <pre class="cmd" id="confirmCmd"></pre>
+      <p class="hint" id="confirmName"></p>
+      <div class="modal-actions">
+        <button class="btn ghost" id="btnCancelConfirm">取消</button>
+        <button class="btn primary" id="btnDoConfirm">确认安装</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 日志抽屉 -->
+  <div class="overlay hidden" id="logOverlay">
+    <aside class="drawer log-drawer">
+      <div class="drawer-head">
+        <h2 id="logTitle">部署日志</h2>
+        <button class="btn ghost small" id="btnCloseLog">关闭</button>
+      </div>
+      <pre class="log" id="logOut"></pre>
+      <p class="hint" id="logHint"></p>
+    </aside>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

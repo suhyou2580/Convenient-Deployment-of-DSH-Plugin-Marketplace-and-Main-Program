@@ -1,0 +1,6 @@
+# Windows 批处理必须用 CRLF 换行，否则 clone 后 cmd.exe 解析错乱、无法启动。
+# 强制 Git 不做换行转换，保证仓库里和检出后都是 CRLF。
+*.bat text eol=crlf
+
+# 其余文本统一 LF，避免跨平台 diff 噪音。
+* text=auto eol=lf
