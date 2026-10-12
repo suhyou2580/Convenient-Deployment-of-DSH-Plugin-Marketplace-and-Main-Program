@@ -9,7 +9,7 @@ const state = {
   size: 24,
   total: 0,
   status: null,
-  webStatus: null,  // dsh web 本体（默认 3080）运行状态 { port, running, pids }
+  webStatus: null,  // dsh web 本体（默认 3080）运行状态 { port, running, pids, url }
   ai: new Map(),    // name -> {intro, tags}
   pendingDeploy: null,  // { kind: 'install'|'remove', item }
 };
@@ -124,8 +124,13 @@ function webChipHtml() {
   const ws = state.webStatus;
   if (!ws) return `<span class="chip loading">dsh web 本体 检测中…</span>`;
   if (ws.running) {
-    const url = `http://127.0.0.1:${ws.port}/`;
-    return `<a class="chip ok link" href="${esc(url)}" target="_blank" rel="noreferrer" title="dsh web 本体运行中，点击打开">dsh web 本体 :${esc(ws.port)} ↗</a>`;
+    // 优先用含 token 的地址（dsh 新版根路径需要鉴权，无 token 会 401）；
+    // 本体若在部署器之外启动，则回退到普通地址（有 cookie 时仍可用）。
+    const url = ws.url || `http://127.0.0.1:${ws.port}/`;
+    const hint = ws.url
+      ? 'dsh web 本体运行中，点击打开（含访问令牌）'
+      : 'dsh web 本体运行中，点击打开（无令牌；若提示需要鉴权，请用 dsh web 打印的带 ?token= 链接打开一次）';
+    return `<a class="chip ok link" href="${esc(url)}" target="_blank" rel="noreferrer" title="${esc(hint)}">dsh web 本体 :${esc(ws.port)} ↗</a>`;
   }
   return `<span class="chip" title="dsh web 本体未运行，点右上按钮启动">dsh web 本体 未运行</span>`;
 }
@@ -140,7 +145,7 @@ async function refreshWebStatus() {
   } catch {
     next = { port, running: false, pids: [] };
   }
-  const key = `${next.port}:${next.running}`;
+  const key = `${next.port}:${next.running}:${next.url || ''}`;
   const changed = _lastWebKey === undefined || _lastWebKey !== key;
   state.webStatus = next;
   _lastWebKey = key;
@@ -404,7 +409,12 @@ async function doRestart(port) {
       else if (ev.type === 'error') append(`\n[错误] ${ev.message}\n`);
       else if (ev.type === 'done') {
         if (ev.code === 0) {
-          append(`\n[完成] dsh web 本体已就绪：${ev.url}\n浏览器应已自动打开；也可点顶部状态徽章打开本体。\n`);
+          append(`\n[完成] dsh web 本体已就绪：${ev.url}\n`);
+          if (ev.authenticated) {
+            append('已捕获含 token 的访问地址，点顶部状态徽章即可打开本体。\n');
+          } else {
+            append('未捕获到 token：若打开本体提示需要鉴权，请复制 dsh web 控制台打印的带 ?token= 的完整 URL 打开一次（之后 30 天内普通链接也可用）。\n');
+          }
           $('logHint').textContent = '本体已就绪 ✅ ' + ev.url;
           toast('dsh web 本体已就绪', 'ok');
         } else {

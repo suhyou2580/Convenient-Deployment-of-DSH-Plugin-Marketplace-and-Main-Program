@@ -429,6 +429,13 @@ async function handleAiDescribe(body) {
 
 const DSH_WEB_PORT_DEFAULT = 3080;
 
+// dsh web 启动时会把带 access token 的访问 URL 打印到标准输出。我们把它重定向到文件，
+// 好在保持「分离启动」的前提下也能读到这个 URL——用管道会随本应用退出而关闭，子进程写会失败。
+const DSH_WEB_LOG = path.join(os.tmpdir(), 'dsh-plugin-deployer-web.log');
+
+let dshWebUrl = null; // 最近一次由本应用启动得到的、带 token 的访问 URL
+let dshWebUrlPort = null; // 上面这个 URL 对应的端口（换端口或外部启动时失效）
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function parsePort(v) {
@@ -456,14 +463,60 @@ function killPid(pid) {
   return execCapture('kill', ['-9', String(pid)], 15000);
 }
 
-// 分离启动，令 dsh web 独立于本应用存活（本应用退出它也不受影响）
-function startDshWebDetached() {
-  const child = spawnCommand('dsh', ['web'], {
-    detached: true,
-    stdio: 'ignore',
-  });
+// 分离启动，令 dsh web 独立于本应用存活（本应用退出它也不受影响），
+// 同时捕获它打印的、带 access token 的访问 URL。
+//
+// 为什么要绕开 `dsh`（.cmd 包装）直接跑 node 入口：Windows 上用 DETACHED_PROCESS 启动时，
+// stdio 传出去的句柄不会被继承到「孙进程」（cmd.exe 的子进程），重定向拿不到任何输出。
+// 直接 spawn 一个可执行文件（node）则正常。回退路径（解析不到入口时）仍有功能，只是读不到 token。
+let dshEntryCache; // undefined=尚未探测；null=未找到
+async function resolveDshEntry() {
+  if (dshEntryCache !== undefined) return dshEntryCache;
+  dshEntryCache = null;
+  if (process.platform === 'win32') {
+    const { out } = await execCapture('where', ['dsh'], 8000);
+    const cmdPath = out.split(/\r?\n/).map((s) => s.trim()).find((p) => /\.cmd$/i.test(p));
+    if (cmdPath) {
+      // 与 npm 生成的 dsh.cmd 一致：node <npm 全局>/node_modules/@deepseek-ai/dsh/lib/bin.js
+      const entry = path.join(path.dirname(cmdPath), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+      if (fs.existsSync(entry)) dshEntryCache = entry;
+    }
+  }
+  return dshEntryCache;
+}
+
+async function startDshWebDetached() {
+  const entry = await resolveDshEntry();
+  if (entry) {
+    const logFd = fs.openSync(DSH_WEB_LOG, 'w'); // 截断：避免匹配到上一次运行的旧 token
+    const child = spawn(process.execPath, [entry, 'web'], {
+      detached: true,
+      windowsHide: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+    fs.closeSync(logFd); // 子进程已继承该 fd，父进程这份可关
+    child.unref();
+    return child.pid;
+  }
+  const child = spawnCommand('dsh', ['web'], { detached: true, stdio: 'ignore' });
   child.unref();
   return child.pid;
+}
+
+// 从 dsh web 的输出里解析带 token 的访问 URL（形如 http://127.0.0.1:3080/?token=xxxx）。
+async function captureWebUrl(port, timeoutMs) {
+  const re = new RegExp(`https?://\\S*?:${port}/\\S*?token=[\\w-]+`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const m = fs.readFileSync(DSH_WEB_LOG, 'utf8').match(re);
+      if (m) return m[0];
+    } catch {
+      /* 文件尚未生成，继续等 */
+    }
+    await sleep(300);
+  }
+  return null;
 }
 
 async function waitForPort(port, wantListening, timeoutMs) {
@@ -494,11 +547,25 @@ async function handleRestartWeb(res, port) {
     }
 
     emit({ type: 'out', text: '正在启动 dsh web（默认会自动打开浏览器）…\n' });
-    startDshWebDetached();
+    dshWebUrl = null;
+    dshWebUrlPort = null;
+    await startDshWebDetached();
 
     const up = await waitForPort(port, true, 60000);
     if (up) {
-      emit({ type: 'done', code: 0, url: `http://127.0.0.1:${port}/` });
+      // 端口已监听时 dsh 通常已把带 token 的 URL 打印出来，短窗口内读取即可
+      const captured = await captureWebUrl(port, 5000);
+      dshWebUrl = captured;
+      dshWebUrlPort = captured ? port : null;
+      if (captured) {
+        emit({ type: 'out', text: `已捕获本体访问地址（含 token）：${captured}\n` });
+      } else {
+        emit({
+          type: 'out',
+          text: '未捕获到带 token 的地址。若打开本体提示需要鉴权，请复制 dsh web 控制台打印的带 ?token= 的完整 URL 打开一次（之后 30 天内普通链接也可用）。\n',
+        });
+      }
+      emit({ type: 'done', code: 0, url: captured || `http://127.0.0.1:${port}/`, authenticated: !!captured });
     } else {
       emit({ type: 'out', text: '启动后 60 秒内未检测到端口监听。\n' });
       emit({ type: 'done', code: -1 });
@@ -544,7 +611,10 @@ const server = http.createServer(async (req, res) => {
       const port = parsePort(url.searchParams.get('port') ?? DSH_WEB_PORT_DEFAULT);
       if (port === null) return sendJson(res, 400, { error: '非法的端口' });
       const pids = await findListeningPids(port);
-      return sendJson(res, 200, { port, running: pids.length > 0, pids });
+      const running = pids.length > 0;
+      // 仅当本体在运行、且是本应用在相同端口上启动的，才提供带 token 的 URL
+      const webUrl = running && dshWebUrl && dshWebUrlPort === port ? dshWebUrl : null;
+      return sendJson(res, 200, { port, running, pids, url: webUrl });
     }
 
     if (req.method === 'GET' && pathname === '/api/search') {
