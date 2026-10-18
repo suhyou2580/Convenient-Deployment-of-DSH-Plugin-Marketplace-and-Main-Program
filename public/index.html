@@ -137,6 +137,10 @@
         <h2 id="logTitle">部署日志</h2>
         <button class="btn ghost small" id="btnCloseLog">关闭</button>
       </div>
+      <div class="progress-wrap hidden" id="logProgressWrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="progress-track"><div class="progress-fill" id="logProgressFill"></div></div>
+        <div class="progress-label" id="logProgressLabel">准备中…</div>
+      </div>
       <pre class="log" id="logOut"></pre>
       <p class="hint" id="logHint"></p>
     </aside>

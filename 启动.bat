@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo   正在自检环境…
+echo   正在自检环境...
 echo.
 node check.js
 if errorlevel 1 (
@@ -28,16 +28,20 @@ if errorlevel 1 (
 )
 
 echo.
-echo   DSH 插件一键部署器
+echo   正在后台启动服务...
 echo   服务地址：%URL%
-echo   关闭此窗口即可停止服务。
+echo   停止服务：运行「停止.bat」
 echo.
 
-rem 等 2 秒让服务起来后自动打开浏览器（独立最小化窗口，不影响主窗口）
-start "" /min cmd /c "timeout /t 2 /nobreak >nul & start %URL%"
+rem 后台隐藏启动服务（不占用终端），等端口就绪后自动打开浏览器，然后本窗口自动关闭
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; $out=Join-Path $env:TEMP 'dsh-deployer.out.log'; $err=Join-Path $env:TEMP 'dsh-deployer.err.log'; Start-Process -FilePath 'node' -ArgumentList 'server.js' -WorkingDirectory '%~dp0' -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err; $ok=$false; for($i=0;$i -lt 40;$i++){ Start-Sleep -Milliseconds 250; try { Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -TimeoutSec 1 '%URL%/' | Out-Null; $ok=$true; break } catch {} }; if($ok){ Start-Process '%URL%'; exit 0 } else { exit 1 }"
 
-node server.js
+if errorlevel 1 (
+  echo   [错误] 服务未能在 10 秒内启动。
+  echo   请在本目录运行 node server.js 查看具体报错。
+  echo.
+  pause
+  exit /b 1
+)
 
-echo.
-echo   服务已停止。
-pause
+exit

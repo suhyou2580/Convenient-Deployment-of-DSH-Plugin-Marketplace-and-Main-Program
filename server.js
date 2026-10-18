@@ -2,6 +2,7 @@
 // 零依赖：仅用 Node 内置模块。职责：静态托管 + 代理 npm 搜索 + 执行 dsh 插件安装 + AI 简介。
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -78,22 +79,22 @@ function execCapture(cmd, args, timeoutMs = 15000) {
     let out = '';
     let done = false;
     const child = spawnCommand(cmd, args);
-    const timer = setTimeout(() => {
-      if (!done) child.kill();
-    }, timeoutMs);
-    child.stdout.on('data', (d) => (out += d));
-    child.stderr.on('data', (d) => (out += d));
-    child.on('error', () => {
-      done = true;
-      clearTimeout(timer);
-      resolve({ ok: false, out: '' });
-    });
-    child.on('close', (code) => {
+    const finish = (result) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ ok: code === 0, out: out.trim() });
-    });
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      // 不等 close：被终止的 cmd.exe 若留有孙进程（如 netstat），孙进程仍持有管道，
+      // close 可能永远不触发，调用方会无期限挂起。
+      finish({ ok: false, out: out.trim() });
+    }, timeoutMs);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (out += d));
+    child.on('error', () => finish({ ok: false, out: '' }));
+    child.on('close', (code) => finish({ ok: code === 0, out: out.trim() }));
   });
 }
 
@@ -485,11 +486,14 @@ async function resolveDshEntry() {
   return dshEntryCache;
 }
 
-async function startDshWebDetached() {
+async function startDshWebDetached(port) {
+  // --no-open：dsh 自带的浏览器启动器在 Windows 上会额外拉起一个控制台窗口
+  // （launcher node → PowerShell），启动完才自己退出。改由部署器启动完成后隐藏式打开浏览器。
+  const args = ['web', '--port', String(port), '--no-open'];
   const entry = await resolveDshEntry();
   if (entry) {
     const logFd = fs.openSync(DSH_WEB_LOG, 'w'); // 截断：避免匹配到上一次运行的旧 token
-    const child = spawn(process.execPath, [entry, 'web'], {
+    const child = spawn(process.execPath, [entry, ...args], {
       detached: true,
       windowsHide: true,
       stdio: ['ignore', logFd, logFd],
@@ -498,7 +502,7 @@ async function startDshWebDetached() {
     child.unref();
     return child.pid;
   }
-  const child = spawnCommand('dsh', ['web'], { detached: true, stdio: 'ignore' });
+  const child = spawnCommand('dsh', args, { detached: true, stdio: 'ignore' });
   child.unref();
   return child.pid;
 }
@@ -519,11 +523,56 @@ async function captureWebUrl(port, timeoutMs) {
   return null;
 }
 
-async function waitForPort(port, wantListening, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
+// 用 TCP 连接探测端口是否在监听。不 spawn netstat：子进程一旦卡住会把整个等待流程拖死。
+function isPortListening(port, timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(v);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
+}
+
+// 用系统默认浏览器打开 URL。cmd /c start 会立刻退出，加上 windowsHide 不产生可见窗口；
+// 这样就不需要 dsh 自己的浏览器启动器，也就没有需要清理的 cmd 进程。
+function openUrl(url) {
+  try {
+    let child;
+    if (process.platform === 'win32') {
+      child = spawn('cmd.exe', ['/d', '/c', 'start', '""', url], {
+        detached: true,
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+    } else if (process.platform === 'darwin') {
+      child = spawn('open', [url], { detached: true, stdio: 'ignore' });
+    } else {
+      child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
+    }
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPort(port, wantListening, timeoutMs, onProgress) {
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  let lastReport = start;
   while (Date.now() < deadline) {
-    const pids = await findListeningPids(port);
-    if (wantListening ? pids.length > 0 : pids.length === 0) return true;
+    if ((await isPortListening(port)) === wantListening) return true;
+    if (onProgress && Date.now() - lastReport >= 5000) {
+      lastReport = Date.now();
+      onProgress(Math.round((Date.now() - start) / 1000));
+    }
     await sleep(500);
   }
   return false;
@@ -546,12 +595,14 @@ async function handleRestartWeb(res, port) {
       emit({ type: 'out', text: freed ? '端口已释放。\n' : '警告：端口仍被占用，继续尝试启动。\n' });
     }
 
-    emit({ type: 'out', text: '正在启动 dsh web（默认会自动打开浏览器）…\n' });
+    emit({ type: 'out', text: `正在启动 dsh web --port ${port}（默认会自动打开浏览器）…\n` });
     dshWebUrl = null;
     dshWebUrlPort = null;
-    await startDshWebDetached();
+    await startDshWebDetached(port);
 
-    const up = await waitForPort(port, true, 60000);
+    const up = await waitForPort(port, true, 60000, (seconds) => {
+      emit({ type: 'out', text: `等待端口 ${port} 开始监听…（已等待 ${seconds} 秒）\n` });
+    });
     if (up) {
       // 端口已监听时 dsh 通常已把带 token 的 URL 打印出来，短窗口内读取即可
       const captured = await captureWebUrl(port, 5000);
@@ -565,7 +616,13 @@ async function handleRestartWeb(res, port) {
           text: '未捕获到带 token 的地址。若打开本体提示需要鉴权，请复制 dsh web 控制台打印的带 ?token= 的完整 URL 打开一次（之后 30 天内普通链接也可用）。\n',
         });
       }
-      emit({ type: 'done', code: 0, url: captured || `http://127.0.0.1:${port}/`, authenticated: !!captured });
+      const target = captured || `http://127.0.0.1:${port}/`;
+      const opened = openUrl(target);
+      emit({
+        type: 'out',
+        text: opened ? '已在默认浏览器中打开本体。\n' : '无法自动打开浏览器，请点顶部状态徽章打开本体。\n',
+      });
+      emit({ type: 'done', code: 0, url: target, authenticated: !!captured, opened });
     } else {
       emit({ type: 'out', text: '启动后 60 秒内未检测到端口监听。\n' });
       emit({ type: 'done', code: -1 });

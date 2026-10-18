@@ -355,11 +355,47 @@ function openLog(title, hint) {
   $('logTitle').textContent = title;
   $('logOut').textContent = '';
   $('logHint').textContent = hint || '';
+  resetProgress();
   return (text) => {
     const out = $('logOut');
     out.textContent += text;
     out.scrollTop = out.scrollHeight;
   };
+}
+
+// ---------- 启动本体进度条 ----------
+function resetProgress() {
+  $('logProgressWrap').classList.add('hidden');
+  $('logProgressFill').style.width = '0%';
+  $('logProgressFill').className = 'progress-fill';
+  $('logProgressLabel').textContent = '';
+  $('logProgressWrap').setAttribute('aria-valuenow', '0');
+}
+
+function setProgress(pct, label, state = '') {
+  const wrap = $('logProgressWrap');
+  wrap.classList.remove('hidden');
+  const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+  $('logProgressFill').style.width = clamped + '%';
+  $('logProgressFill').className = 'progress-fill' + (state ? ' ' + state : '');
+  $('logProgressLabel').textContent = label;
+  wrap.setAttribute('aria-valuenow', String(clamped));
+}
+
+function applyRestartProgress(text) {
+  if (text.includes('检查端口')) return setProgress(10, '检查本体端口');
+  if (text.includes('正在停止') || text.includes('发现 PID')) return setProgress(25, '停止旧进程');
+  if (text.includes('端口已释放') || text.includes('将直接启动') || text.includes('端口仍被占用')) {
+    return setProgress(35, '准备启动');
+  }
+  if (text.includes('正在启动 dsh web')) return setProgress(45, '启动 dsh web');
+  const waited = text.match(/已等待 (\d+) 秒/);
+  if (waited) {
+    return setProgress(Math.min(90, 45 + Number(waited[1]) * 0.75), `等待端口监听…（${waited[1]} 秒）`);
+  }
+  if (text.includes('已捕获本体访问地址')) return setProgress(95, '获取访问令牌');
+  if (text.includes('正在打开本体')) return setProgress(98, '打开本体');
+  if (text.includes('已在默认浏览器中打开')) return setProgress(99, '已打开本体');
 }
 
 async function doDeploy() {
@@ -403,11 +439,16 @@ async function doDeploy() {
 
 async function doRestart(port) {
   const append = openLog('启动 / 重启 dsh web', `正在操作 127.0.0.1:${port} …`);
+  setProgress(5, `准备操作 127.0.0.1:${port}`);
   try {
     await streamPost('/api/restart-web', { port }, (ev) => {
-      if (ev.type === 'out') append(ev.text);
-      else if (ev.type === 'error') append(`\n[错误] ${ev.message}\n`);
-      else if (ev.type === 'done') {
+      if (ev.type === 'out') {
+        append(ev.text);
+        applyRestartProgress(ev.text);
+      } else if (ev.type === 'error') {
+        append(`\n[错误] ${ev.message}\n`);
+        setProgress(100, '失败：' + ev.message, 'err');
+      } else if (ev.type === 'done') {
         if (ev.code === 0) {
           append(`\n[完成] dsh web 本体已就绪：${ev.url}\n`);
           if (ev.authenticated) {
@@ -415,10 +456,12 @@ async function doRestart(port) {
           } else {
             append('未捕获到 token：若打开本体提示需要鉴权，请复制 dsh web 控制台打印的带 ?token= 的完整 URL 打开一次（之后 30 天内普通链接也可用）。\n');
           }
+          setProgress(100, '本体已就绪', 'ok');
           $('logHint').textContent = '本体已就绪 ✅ ' + ev.url;
           toast('dsh web 本体已就绪', 'ok');
         } else {
           append('\n[失败] 本体未启动成功，请查看上方日志。\n');
+          setProgress(100, '启动失败', 'err');
           $('logHint').textContent = '启动/重启失败';
           toast('本体启动失败，见日志', 'err');
         }
@@ -426,6 +469,7 @@ async function doRestart(port) {
     });
   } catch (e) {
     append(`\n[错误] ${e.message}\n`);
+    setProgress(100, '请求失败', 'err');
     $('logHint').textContent = '请求失败：' + e.message;
   }
   refreshWebStatus();
