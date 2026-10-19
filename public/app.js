@@ -106,7 +106,7 @@ function renderStatus() {
   const s = state.status;
   const chips = [];
   chips.push(s.dshInstalled
-    ? `<span class="chip ok">dsh ${esc(s.dshVersion)}</span>`
+    ? `<span class="chip ok" title="${esc(s.dshPath || '未捕获绝对路径，使用 PATH 中的 dsh')}">dsh ${esc(s.dshVersion)}</span>`
     : `<span class="chip bad">未检测到 dsh</span>`);
   chips.push(s.pnpmInstalled
     ? `<span class="chip ok">pnpm ${esc(s.pnpmVersion)}</span>`
@@ -117,6 +117,18 @@ function renderStatus() {
   $('pnpmBanner').classList.toggle('hidden', !!s.pnpmInstalled);
   $('deployHint').textContent =
     `安装命令：dsh plugin --profile ${s.profiles?.[0] || 'web'} add <包名>　·　装完需重启 dsh web 生效。Profiles 目录：${s.profilesDir}`;
+  renderDshPath();
+}
+
+// 设置面板里展示自动捕获到的 dsh 程序入口
+function renderDshPath() {
+  const input = $('setDshPath');
+  if (!input) return;
+  const s = state.status;
+  input.value = s?.dshPath || '';
+  input.title = s?.dshPath
+    ? `捕获来源：${s.dshSource || '未知'}${s.dshPackageDir ? `\n安装目录：${s.dshPackageDir}` : ''}`
+    : '未捕获到 dsh 程序的绝对路径，启动时将使用 PATH 中的 dsh';
 }
 
 // dsh web 本体状态徽章：运行中可点击直接打开本体
@@ -388,6 +400,8 @@ function applyRestartProgress(text) {
   if (text.includes('端口已释放') || text.includes('将直接启动') || text.includes('端口仍被占用')) {
     return setProgress(35, '准备启动');
   }
+  if (text.includes('dsh 程序：')) return setProgress(42, '定位 dsh 程序');
+  if (text.includes('未捕获到 dsh 程序路径')) return setProgress(42, '回退到 PATH 中的 dsh');
   if (text.includes('正在启动 dsh web')) return setProgress(45, '启动 dsh web');
   const waited = text.match(/已等待 (\d+) 秒/);
   if (waited) {
@@ -666,6 +680,7 @@ function openSettings() {
   $('setBaseUrl').value = s.baseUrl;
   $('setModel').value = s.model;
   $('setApiKey').value = s.apiKey;
+  renderDshPath();
   $('settingsOverlay').classList.remove('hidden');
 }
 

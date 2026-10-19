@@ -176,14 +176,163 @@ function assertRemovable(profile, name) {
   }
 }
 
+// ---------- dsh 程序本体探测 ----------
+// 目标：拿到 @deepseek-ai/dsh 的真实 JS 入口（lib/bin.js），启动本体时直接用它，
+// 不依赖 shim 是否在当前进程的 PATH 里，也绕开 Windows 的 .cmd 包装（见 startDshWebDetached）。
+
+function readDshPackageMeta(entry) {
+  try {
+    const pkgFile = path.resolve(entry, '..', '..', 'package.json');
+    const json = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+    if (json.name !== '@deepseek-ai/dsh') return null;
+    return { version: json.version || null, packageDir: path.dirname(pkgFile) };
+  } catch {
+    return null;
+  }
+}
+
+// npm / pnpm 生成的命令行 shim（.cmd / .ps1 / sh）里写着真实 JS 入口，
+// 解析它就能适配 nvm、自定义 prefix 等非默认安装位置。
+function entryFromShim(shimPath) {
+  let text;
+  try {
+    text = fs.readFileSync(shimPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const dir = path.dirname(shimPath);
+  for (const m of text.matchAll(/["']([^"'\r\n]+\.js)["']/g)) {
+    const raw = m[1]
+      .replace(/%dp0%/gi, dir)
+      .replace(/\$basedir/gi, dir)
+      .replace(/\$\{basedir\}/gi, dir);
+    const candidate = path.normalize(raw);
+    if (path.isAbsolute(candidate) && readDshPackageMeta(candidate)) return candidate;
+  }
+  return null;
+}
+
+function staticDshEntries() {
+  const list = [];
+  if (process.platform === 'win32') {
+    if (process.env.APPDATA) {
+      list.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+    }
+    if (process.env.LOCALAPPDATA) {
+      list.push(path.join(process.env.LOCALAPPDATA, 'pnpm', 'global', '5', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+      list.push(path.join(process.env.LOCALAPPDATA, 'pnpm', 'global', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+    }
+    list.push(path.join(path.dirname(process.execPath), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+    if (process.env.ProgramFiles) {
+      list.push(path.join(process.env.ProgramFiles, 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+    }
+  } else {
+    list.push(
+      path.join('/usr/local/lib/node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+      path.join('/usr/lib/node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+      path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+      path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+    );
+  }
+  return list;
+}
+
+function dshInfoFrom(entry, source, command) {
+  if (!entry) return null;
+  const meta = readDshPackageMeta(entry);
+  if (!meta) return null;
+  return { entry: path.normalize(entry), packageDir: meta.packageDir, version: meta.version, source, command };
+}
+
+let dshInfoCache = null;
+let dshInfoPromise = null;
+
+async function detectDsh({ refresh = false } = {}) {
+  if (refresh) dshInfoCache = null;
+  if (dshInfoCache) return dshInfoCache;
+  if (dshInfoPromise) return dshInfoPromise;
+
+  dshInfoPromise = (async () => {
+    let command = null;
+    let info = null;
+
+    if (process.platform === 'win32') {
+      const { out } = await execCapture('where', ['dsh'], 8000);
+      const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      command = lines.find((l) => /\.cmd$/i.test(l)) || lines.find((l) => /\.exe$/i.test(l)) || lines[0] || null;
+      for (const line of lines) {
+        info ||= dshInfoFrom(line, 'PATH', command);
+        info ||= dshInfoFrom(entryFromShim(line), 'PATH shim', command);
+      }
+      // shim 内容解析不到时，按 npm 全局前缀推导（<prefix>/node_modules/...）
+      if (!info && command) {
+        info = dshInfoFrom(
+          path.join(path.dirname(command), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+          'PATH 前缀',
+          command,
+        );
+      }
+    } else {
+      const { out } = await execCapture('which', ['dsh'], 8000);
+      command = out.split(/\r?\n/)[0]?.trim() || null;
+      if (command) {
+        let real = command;
+        try { real = fs.realpathSync(command); } catch { /* 保持原路径 */ }
+        info = dshInfoFrom(real, 'PATH', command) || dshInfoFrom(entryFromShim(real), 'PATH shim', command);
+      }
+    }
+
+    for (const candidate of staticDshEntries()) {
+      info ||= dshInfoFrom(candidate, '常见安装位置', command);
+    }
+
+    if (!info) {
+      const npmRoot = await execCapture('npm', ['root', '-g'], 15000);
+      const root = npmRoot.ok ? npmRoot.out.split(/\r?\n/)[0]?.trim() : '';
+      if (root) info = dshInfoFrom(path.join(root, '@deepseek-ai', 'dsh', 'lib', 'bin.js'), 'npm root -g', command);
+    }
+
+    if (!info) {
+      const pnpmRoot = await execCapture('pnpm', ['root', '-g'], 15000);
+      const root = pnpmRoot.ok ? pnpmRoot.out.split(/\r?\n/)[0]?.trim() : '';
+      if (root) info = dshInfoFrom(path.join(root, '@deepseek-ai', 'dsh', 'lib', 'bin.js'), 'pnpm root -g', command);
+    }
+
+    dshInfoCache = info || { entry: null, packageDir: null, version: null, source: null, command };
+    return dshInfoCache;
+  })()
+    .catch(() => {
+      dshInfoCache = { entry: null, packageDir: null, version: null, source: null, command: null };
+      return dshInfoCache;
+    })
+    .finally(() => {
+      dshInfoPromise = null;
+    });
+
+  return dshInfoPromise;
+}
+
 async function getStatus() {
-  const [dsh, pnpm] = await Promise.all([
-    execCapture('dsh', ['--version']),
+  const [pnpm, info] = await Promise.all([
     execCapture('pnpm', ['--version']),
+    detectDsh(),
   ]);
+
+  let dshInstalled = !!info.entry;
+  let dshVersion = info.version;
+  if (!dshInstalled) {
+    const dsh = await execCapture('dsh', ['--version']);
+    dshInstalled = dsh.ok;
+    dshVersion = dsh.ok ? dsh.out.split(/\r?\n/)[0] : null;
+  }
+
   return {
-    dshVersion: dsh.ok ? dsh.out : null,
-    dshInstalled: dsh.ok,
+    dshInstalled,
+    dshVersion,
+    dshPath: info.entry,
+    dshPackageDir: info.packageDir,
+    dshSource: info.source,
+    dshCommand: info.command,
     pnpmInstalled: pnpm.ok,
     pnpmVersion: pnpm.ok ? pnpm.out : null,
     profiles: listProfiles(),
@@ -470,41 +619,25 @@ function killPid(pid) {
 // 为什么要绕开 `dsh`（.cmd 包装）直接跑 node 入口：Windows 上用 DETACHED_PROCESS 启动时，
 // stdio 传出去的句柄不会被继承到「孙进程」（cmd.exe 的子进程），重定向拿不到任何输出。
 // 直接 spawn 一个可执行文件（node）则正常。回退路径（解析不到入口时）仍有功能，只是读不到 token。
-let dshEntryCache; // undefined=尚未探测；null=未找到
-async function resolveDshEntry() {
-  if (dshEntryCache !== undefined) return dshEntryCache;
-  dshEntryCache = null;
-  if (process.platform === 'win32') {
-    const { out } = await execCapture('where', ['dsh'], 8000);
-    const cmdPath = out.split(/\r?\n/).map((s) => s.trim()).find((p) => /\.cmd$/i.test(p));
-    if (cmdPath) {
-      // 与 npm 生成的 dsh.cmd 一致：node <npm 全局>/node_modules/@deepseek-ai/dsh/lib/bin.js
-      const entry = path.join(path.dirname(cmdPath), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-      if (fs.existsSync(entry)) dshEntryCache = entry;
-    }
-  }
-  return dshEntryCache;
-}
-
-async function startDshWebDetached(port) {
+async function startDshWebDetached(port, dsh = null) {
   // --no-open：dsh 自带的浏览器启动器在 Windows 上会额外拉起一个控制台窗口
   // （launcher node → PowerShell），启动完才自己退出。改由部署器启动完成后隐藏式打开浏览器。
   const args = ['web', '--port', String(port), '--no-open'];
-  const entry = await resolveDshEntry();
-  if (entry) {
+  const info = dsh || (await detectDsh());
+  if (info.entry) {
     const logFd = fs.openSync(DSH_WEB_LOG, 'w'); // 截断：避免匹配到上一次运行的旧 token
-    const child = spawn(process.execPath, [entry, ...args], {
+    const child = spawn(process.execPath, [info.entry, ...args], {
       detached: true,
       windowsHide: true,
       stdio: ['ignore', logFd, logFd],
     });
     fs.closeSync(logFd); // 子进程已继承该 fd，父进程这份可关
     child.unref();
-    return child.pid;
+    return { pid: child.pid, entry: info.entry };
   }
   const child = spawnCommand('dsh', args, { detached: true, stdio: 'ignore' });
   child.unref();
-  return child.pid;
+  return { pid: child.pid, entry: null };
 }
 
 // 从 dsh web 的输出里解析带 token 的访问 URL（形如 http://127.0.0.1:3080/?token=xxxx）。
@@ -595,10 +728,18 @@ async function handleRestartWeb(res, port) {
       emit({ type: 'out', text: freed ? '端口已释放。\n' : '警告：端口仍被占用，继续尝试启动。\n' });
     }
 
-    emit({ type: 'out', text: `正在启动 dsh web --port ${port}（默认会自动打开浏览器）…\n` });
+    const dsh = await detectDsh({ refresh: true });
+    emit({
+      type: 'out',
+      text: dsh.entry
+        ? `dsh 程序：${dsh.entry}${dsh.source ? `（捕获自 ${dsh.source}）` : ''}\n`
+        : '未捕获到 dsh 程序路径，将回退到 PATH 中的 dsh。\n',
+    });
+
+    emit({ type: 'out', text: `正在启动 dsh web --port ${port}（--no-open，由部署器打开浏览器）…\n` });
     dshWebUrl = null;
     dshWebUrlPort = null;
-    await startDshWebDetached(port);
+    await startDshWebDetached(port, dsh);
 
     const up = await waitForPort(port, true, 60000, (seconds) => {
       emit({ type: 'out', text: `等待端口 ${port} 开始监听…（已等待 ${seconds} 秒）\n` });
